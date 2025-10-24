@@ -1,0 +1,6 @@
+We need to check the status for various components of the Slack platform.
+The steps are as below:
+1. Navigate to https://slack-status.com/. Wait for the page to load.
+2. Check the overall status of the Slack platform. Provide a textual representation of the status in the format "OK" or "Not OK".
+3. List the status for each of the features of the Slack platform in a well formed JSON format.
+4. Provide an overall summary of the services in a well defined JSON format that can be consumed by programming languages.

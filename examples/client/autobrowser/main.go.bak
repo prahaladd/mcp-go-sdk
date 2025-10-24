@@ -1,0 +1,422 @@
+// Copyright 2025 The Go MCP SDK Authors. All rights reserved.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
+
+// The autobrowser command connects to an MCP server and uses OpenAI API for interaction.
+//
+// Usage: autobrowser <command> [<args>]
+//
+// For example:
+//
+//	autobrowser go run github.com/modelcontextprotocol/go-sdk/examples/server/hello
+//
+// or
+//
+//	autobrowser npx browsermcp/mcp@latest
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	openai "github.com/sashabaranov/go-openai"
+)
+
+// Global MCP session for tool execution
+var globalMCPSession *mcp.ClientSession
+
+func main() {
+	// Define command-line flags
+	var filePath string
+	flag.StringVar(&filePath, "file", "", "Path to a file whose content will be sent to OpenAI")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: autobrowser [--file=<path>] <command> [<args>]\n")
+		fmt.Fprintf(os.Stderr, "Connects to an MCP server and uses OpenAI API for interaction\n")
+		fmt.Fprintf(os.Stderr, "Example: autobrowser npx browsermcp/mcp@latest\n")
+		fmt.Fprintf(os.Stderr, "Example with file: autobrowser --file=./myfile.txt npx browsermcp/mcp@latest\n")
+		os.Exit(2)
+	}
+
+	// Get OpenAI API key from environment
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		log.Fatal("OPENAI_API_KEY environment variable is required")
+	}
+
+	// Initialize OpenAI client
+	openaiClient := openai.NewClient(apiKey)
+
+	// Initialize MCP connection
+	ctx := context.Background()
+	cmd := exec.Command(args[0], args[1:]...)
+	client := mcp.NewClient(&mcp.Implementation{Name: "autobrowser-client", Version: "v1.0.0"}, nil)
+	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer session.Close()
+
+	// Store session globally for tool execution
+	globalMCPSession = session
+
+	fmt.Println("Connected to MCP server successfully")
+
+	// Get available tools
+	tools := listTools(ctx, session)
+
+	// Prompt user to connect browser
+	fmt.Println("\n=== IMPORTANT ===")
+	fmt.Println("Please connect your browser to the MCP server now.")
+	fmt.Println("Once connected, press Enter to continue...")
+	fmt.Print("> ")
+
+	// Wait for user input
+	reader := bufio.NewReader(os.Stdin)
+	_, _ = reader.ReadString('\n')
+	fmt.Println("Continuing with browser automation...")
+
+	// Verify browser tools are available
+	fmt.Println("\nVerifying browser connection...")
+	browserTools := verifyBrowserTools(ctx, session)
+	if len(browserTools) == 0 {
+		fmt.Println("Warning: No browser tools detected. The browser might not be properly connected.")
+		fmt.Println("Do you want to continue anyway? (y/n)")
+		fmt.Print("> ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+		if input != "y" && input != "Y" {
+			fmt.Println("Exiting. Please try again after connecting the browser.")
+			os.Exit(0)
+		}
+		// Use the original tools if user wants to continue
+		browserTools = tools
+	}
+
+	// Use the original tools if user wants to continue
+	if len(browserTools) == 0 {
+		browserTools = tools
+	} else {
+		fmt.Printf("Browser successfully connected! Found %d browser tools.\n", len(browserTools))
+		// Update tools list with the current browser tools
+		tools = browserTools
+	}
+
+	// Prepare message for OpenAI
+	var message string
+	if filePath != "" {
+		// Read the file content if file path is provided
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Fatalf("Error reading file %s: %v", filePath, err)
+		}
+		message = fmt.Sprintf("Here's a document that contains a numbered sequence of steps between {steps} and {/steps} delimiters, that require to be automated.\n\n{steps}%s{/steps}\n\nAnalyze one step at a time and return the next step to be performed.Think step by step. Restrict the tools to the  list provided in the request.\n", string(content))
+		fmt.Printf("Using content from file: %s\n", filePath)
+	} else {
+		// Use default message if no file path is provided
+		message = "Please demonstrate how to use the browser tools by navigating to a website about artificial intelligence and taking a screenshot. Use the tools provided rather than just telling me what you would do."
+		fmt.Println("Using default message")
+	}
+
+	// Send request to OpenAI with verified browser tools
+	resp, err := sendChatRequest(ctx, openaiClient, message, tools)
+	if err != nil {
+		log.Fatalf("Error calling OpenAI API: %v", err)
+	}
+
+	fmt.Println("\nOpenAI Response:")
+	fmt.Println(resp)
+}
+
+// List available tools from the MCP server
+func listTools(ctx context.Context, session *mcp.ClientSession) []*mcp.Tool {
+	var tools []*mcp.Tool
+
+	fmt.Println("Available tools:")
+	for tool, err := range session.Tools(ctx, nil) {
+		if err != nil {
+			break // End of iteration
+		}
+
+		fmt.Printf("\t%s: %s\n", tool.Name, tool.Description)
+		tools = append(tools, tool)
+	}
+
+	return tools
+}
+
+// Verify that browser-specific tools are available
+func verifyBrowserTools(ctx context.Context, session *mcp.ClientSession) []*mcp.Tool {
+	var browserTools []*mcp.Tool
+
+	// Common browser tool name prefixes to look for
+	browserPrefixes := []string{
+		"browser_navigate",
+		"browser_click",
+		"browser_type",
+		"browser_snapshot",
+		"mcp_browser",
+	}
+
+	fmt.Println("Looking for browser tools:")
+	for tool, err := range session.Tools(ctx, nil) {
+		if err != nil {
+			break // End of iteration
+		}
+
+		// Check if this is a browser-related tool
+		isBrowserTool := false
+		for _, prefix := range browserPrefixes {
+			if strings.HasPrefix(tool.Name, prefix) {
+				isBrowserTool = true
+				break
+			}
+		}
+
+		if isBrowserTool {
+			fmt.Printf("\t✓ Found: %s\n", tool.Name)
+			browserTools = append(browserTools, tool)
+		}
+	}
+
+	if len(browserTools) == 0 {
+		fmt.Println("\tNo browser tools found. Browser may not be connected properly.")
+	}
+
+	return browserTools
+}
+
+// Convert MCP tools to OpenAI tool format
+func convertToOpenAITools(mcpTools []*mcp.Tool) []openai.Tool {
+	var tools []openai.Tool
+
+	for _, t := range mcpTools {
+		// Skip tools with missing schemas
+		if t.InputSchema == nil {
+			fmt.Printf("WARNING: Tool %s has nil InputSchema, skipping\n", t.Name)
+			continue
+		}
+
+		// Convert the input schema to a map
+		schemaBytes, err := json.Marshal(t.InputSchema)
+		if err != nil {
+			fmt.Printf("WARNING: Error marshaling schema for tool %s: %v\n", t.Name, err)
+			continue
+		}
+
+		var schemaMap map[string]interface{}
+		if err := json.Unmarshal(schemaBytes, &schemaMap); err != nil {
+			fmt.Printf("WARNING: Error unmarshaling schema for tool %s: %v\n", t.Name, err)
+			continue
+		}
+
+		// Ensure the schema has the minimum required properties for OpenAI
+		// OpenAI requires at least type and properties fields
+		if schemaMap == nil {
+			schemaMap = make(map[string]interface{})
+		}
+
+		// Check if type is missing and add it
+		if _, ok := schemaMap["type"]; !ok {
+			schemaMap["type"] = "object"
+		}
+
+		// Check if properties is missing and add it
+		if _, ok := schemaMap["properties"]; !ok {
+			schemaMap["properties"] = map[string]interface{}{}
+		}
+
+		// Create a proper description that encourages tool use
+		description := t.Description
+		if description == "" {
+			description = fmt.Sprintf("Use this tool to %s", t.Name)
+		}
+
+		// Convert the tool to OpenAI format
+		tool := openai.Tool{
+			Type: "function",
+			Function: &openai.FunctionDefinition{
+				Name:        t.Name,
+				Description: description,
+				Parameters:  schemaMap,
+			},
+		}
+		tools = append(tools, tool)
+	}
+
+	return tools
+}
+
+// Send a chat request to OpenAI
+func sendChatRequest(ctx context.Context, client *openai.Client, userMessage string, mcpTools []*mcp.Tool) (string, error) {
+	// Get the MCP session for tool execution
+	mcpSession := getMCPSession()
+	if mcpSession == nil {
+		return "", fmt.Errorf("MCP session not available for tool execution")
+	}
+
+	// Convert MCP tools to OpenAI format
+	tools := convertToOpenAITools(mcpTools)
+
+	// Debug: Print tool schemas to help diagnose issues
+	if os.Getenv("DEBUG") == "1" {
+		fmt.Println("Tool schemas being sent to OpenAI:")
+		for i, tool := range tools {
+			fmt.Printf("Tool %d: %s\n", i+1, tool.Function.Name)
+			paramsJSON, _ := json.MarshalIndent(tool.Function.Parameters, "  ", "  ")
+			fmt.Printf("  Parameters: %s\n\n", string(paramsJSON))
+		}
+	}
+
+	// Create chat completion request
+	req := openai.ChatCompletionRequest{
+		Model: openai.GPT4,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role: openai.ChatMessageRoleSystem,
+				Content: "You are an assistant that helps users navigate and control a browser using MCP tools. " +
+					"You MUST use the browser tools provided to you when the user asks for anything related to browsing. " +
+					"Don't just describe what you would do - actually use the tools.",
+			},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: userMessage + " (Please use the browser tools provided to help with this task)",
+			},
+		},
+		Tools:       tools,
+		ToolChoice:  "required", // Force OpenAI to use tools (instead of "auto")
+		Temperature: 0.2,        // Lower temperature for more deterministic responses
+	}
+
+	// Dump full JSON request if DEBUG is enabled
+	if os.Getenv("DEBUG") == "1" {
+		requestJSON, _ := json.MarshalIndent(req, "", "  ")
+		fmt.Printf("\n==== FULL OPENAI REQUEST ====\n%s\n==== END REQUEST ====\n\n", string(requestJSON))
+	}
+
+	// Call OpenAI API
+	resp, err := client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		// If we get an error, try to extract more details
+		if apiErr, ok := err.(*openai.APIError); ok {
+			return "", fmt.Errorf("OpenAI API error: Type=%s, Code=%s, Message=%s",
+				apiErr.Type, apiErr.Code, apiErr.Message)
+		}
+		return "", err
+	}
+
+	// Dump the full response JSON if DEBUG is enabled
+	if os.Getenv("DEBUG") == "1" {
+		respJSON, _ := json.MarshalIndent(resp, "", "  ")
+		fmt.Printf("\n==== FULL OPENAI RESPONSE ====\n%s\n==== END RESPONSE ====\n\n", string(respJSON))
+	}
+
+	// Extract the response
+	if len(resp.Choices) > 0 {
+		// Check if there's a tool call in the response
+		if len(resp.Choices[0].Message.ToolCalls) > 0 {
+			var toolCalls []string
+			fmt.Println("\nExecuting tool calls from OpenAI:")
+
+			// Keep track of results for each tool call
+			var toolResults []string
+
+			// Execute each tool call
+			for i, toolCall := range resp.Choices[0].Message.ToolCalls {
+				toolName := toolCall.Function.Name
+				toolArgs := toolCall.Function.Arguments
+
+				fmt.Printf("Tool %d: %s\nArguments: %s\n", i+1, toolName, toolArgs)
+
+				// Execute the tool and get results
+				result, err := executeMCPTool(ctx, mcpSession, toolName, toolArgs)
+				if err != nil {
+					toolResults = append(toolResults, fmt.Sprintf("Error executing %s: %v", toolName, err))
+				} else {
+					toolResults = append(toolResults, fmt.Sprintf("Successfully executed %s: %s", toolName, result))
+				}
+
+				// Add to the formatted response
+				toolCalls = append(toolCalls, fmt.Sprintf("Tool: %s, Arguments: %s",
+					toolName, toolArgs))
+			}
+
+			// Combine original response with tool call results
+			return fmt.Sprintf("%s\n\nTool Calls:\n%s\n\nResults:\n%s",
+				resp.Choices[0].Message.Content,
+				strings.Join(toolCalls, "\n"),
+				strings.Join(toolResults, "\n")), nil
+		} else {
+			// Debug: Note when no tool calls were made
+			if os.Getenv("DEBUG") == "1" {
+				fmt.Println("WARNING: OpenAI did not use any tools in the response")
+			}
+		}
+		return resp.Choices[0].Message.Content, nil
+	}
+
+	return "", fmt.Errorf("no response from OpenAI")
+}
+
+// Get the globally stored MCP session
+func getMCPSession() *mcp.ClientSession {
+	return globalMCPSession
+}
+
+// Execute an MCP tool with the given name and arguments
+func executeMCPTool(ctx context.Context, mcpSession *mcp.ClientSession, toolName string, argsJSON string) (string, error) {
+	if mcpSession == nil {
+		return "", fmt.Errorf("MCP session is not available")
+	}
+
+	// Parse the arguments JSON
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("failed to parse tool arguments: %v", err)
+	}
+
+	fmt.Printf("Executing MCP tool: %s with args: %v\n", toolName, args)
+
+	// Find the tool by name
+	var targetTool *mcp.Tool
+	for tool, err := range mcpSession.Tools(ctx, nil) {
+		if err != nil {
+			break
+		}
+		if tool.Name == toolName {
+			targetTool = tool
+			break
+		}
+	}
+
+	if targetTool == nil {
+		return "", fmt.Errorf("tool not found: %s", toolName)
+	}
+
+	// Execute the tool
+	result, err := mcpSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      toolName,
+		Arguments: args,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to execute tool: %v", err)
+	}
+
+	// Convert result to string representation
+	resultJSON, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal result: %v", err)
+	}
+
+	return string(resultJSON), nil
+}

@@ -1,0 +1,1 @@
+./autobrowser --file=/workspaces/mcp-go-sdk/workflows/instructions.txt npx "@browsermcp/mcp@latest"

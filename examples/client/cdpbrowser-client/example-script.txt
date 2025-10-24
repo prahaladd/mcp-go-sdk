@@ -1,0 +1,26 @@
+# Example CDP Browser Script
+# This script demonstrates basic browser automation
+
+# Set Chrome to stay open when server exits
+lifecycle true
+
+# Navigate to example.com
+navigate https://example.com
+
+# Wait for page to load
+wait 2
+
+# Take a screenshot
+screenshot
+
+# Navigate to another site
+navigate https://httpbin.org
+
+# Wait for page to load
+wait 3
+
+# Take another screenshot
+screenshot
+
+# List available tools
+list-tools

@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"iter"
@@ -47,7 +48,11 @@ func main() {
 	}
 	defer cs.Close()
 
-	printSection("tools", cs.Tools(ctx, nil), func(t *mcp.Tool) string { return t.Name })
+	printSection("tools", cs.Tools(ctx, nil), func(t *mcp.Tool) string {
+		printToolDetails(t)
+		return fmt.Sprintf("Name:%s\nDescription:%s", t.Name, t.Description)
+
+	})
 	printSection("resources", cs.Resources(ctx, nil), func(r *mcp.Resource) string { return r.Name })
 	printSection("resource templates", cs.ResourceTemplates(ctx, nil), func(r *mcp.ResourceTemplate) string { return r.Name })
 	printSection("prompts", cs.Prompts(ctx, nil), func(p *mcp.Prompt) string { return p.Name })
@@ -62,4 +67,27 @@ func printSection[T any](name string, features iter.Seq2[T, error], featName fun
 		fmt.Printf("\t%s\n", featName(feat))
 	}
 	fmt.Println()
+}
+
+func printToolDetails(t *mcp.Tool) {
+	fmt.Printf("Tool: %s\n", t.Name)
+	fmt.Printf("\tDescription: %s\n", t.Description)
+	fmt.Printf("\tInput Schema: %s\n", jsonToString(t.InputSchema))
+	if t.OutputSchema != nil {
+		fmt.Printf("\tOutput Schema: %s\n", jsonToString(t.OutputSchema))
+	}
+	if t.Meta != nil {
+		fmt.Printf("\tMeta: %s\n", jsonToString(t.Meta))
+	}
+}
+
+func jsonToString(v any) string {
+	if v == nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }

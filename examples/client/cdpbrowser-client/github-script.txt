@@ -1,0 +1,23 @@
+# GitHub Navigation Script
+# Automates navigation to GitHub and takes screenshots
+
+# Ensure Chrome stays open
+lifecycle true
+
+# Navigate to GitHub
+navigate https://github.com
+
+# Wait for page load
+wait 3
+
+# Take screenshot of GitHub homepage
+screenshot
+
+# Navigate to explore page
+navigate https://github.com/explore
+
+# Wait for load
+wait 2
+
+# Take screenshot of explore page
+screenshot

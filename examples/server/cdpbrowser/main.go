@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -381,6 +382,316 @@ func (s *CDPBrowserServer) SetChromeLifecycle(ctx context.Context, req *mcp.Serv
 	}, nil
 }
 
+type ARIASnapshotArgs struct {
+	Format string `json:"format" jsonschema:"Output format: llm-text, json, debug"`
+	Focus  string `json:"focus" jsonschema:"Focus area: all, interactive, landmarks, headings"`
+}
+
+// ARIASnapshot tool - captures page accessibility structure for LLM consumption
+func (s *CDPBrowserServer) ARIASnapshot(ctx context.Context, req *mcp.ServerRequest[*mcp.CallToolParamsFor[ARIASnapshotArgs]]) (*mcp.CallToolResultFor[struct{}], error) {
+	format := req.Params.Arguments.Format
+	focus := req.Params.Arguments.Focus
+
+	// Default values
+	if format == "" {
+		format = "llm-text"
+	}
+	if focus == "" {
+		focus = "all"
+	}
+
+	// JavaScript to extract ARIA and DOM structure
+	js := `
+(function() {
+function extractARIASnapshot(focus) {
+	const result = {
+		page: {
+			title: document.title,
+			url: window.location.href,
+			timestamp: new Date().toISOString()
+		},
+		landmarks: [],
+		interactive: [],
+		headings: [],
+		content: []
+	};
+	
+	// Helper function to get accessible name
+	function getAccessibleName(element) {
+		return element.getAttribute('aria-label') || 
+			   element.getAttribute('aria-labelledby') && document.getElementById(element.getAttribute('aria-labelledby'))?.textContent ||
+			   element.textContent?.trim().substring(0, 100) ||
+			   element.getAttribute('title') ||
+			   element.getAttribute('placeholder') ||
+			   element.getAttribute('alt') ||
+			   '';
+	}
+	
+	// Helper function to generate CSS selector
+	function getSelector(element) {
+		if (element.id) return '#' + element.id;
+		
+		let selector = element.tagName.toLowerCase();
+		if (element.className) {
+			const classes = element.className.split(' ').filter(c => c.length > 0);
+			if (classes.length > 0) {
+				selector += '.' + classes[0];
+			}
+		}
+		
+		// Add attribute selectors for common cases
+		if (element.getAttribute('name')) {
+			selector += '[name="' + element.getAttribute('name') + '"]';
+		}
+		if (element.getAttribute('type')) {
+			selector += '[type="' + element.getAttribute('type') + '"]';
+		}
+		
+		return selector;
+	}
+	
+	// Extract landmarks
+	function extractLandmarks() {
+		const landmarkRoles = ['banner', 'navigation', 'main', 'contentinfo', 'complementary', 'region', 'search', 'form'];
+		const landmarkTags = ['header', 'nav', 'main', 'footer', 'aside', 'section'];
+		
+		// Find by role
+		landmarkRoles.forEach(role => {
+			document.querySelectorAll('[role="' + role + '"]').forEach(el => {
+				if (el.offsetParent !== null || role === 'banner' || role === 'contentinfo') { // visible or important
+					result.landmarks.push({
+						role: role,
+						name: getAccessibleName(el),
+						selector: getSelector(el),
+						tag: el.tagName.toLowerCase()
+					});
+				}
+			});
+		});
+		
+		// Find by semantic tags
+		landmarkTags.forEach(tag => {
+			document.querySelectorAll(tag).forEach(el => {
+				if (el.offsetParent !== null && !el.hasAttribute('role')) {
+					const implicitRole = tag === 'header' ? 'banner' : 
+									   tag === 'nav' ? 'navigation' :
+									   tag === 'main' ? 'main' :
+									   tag === 'footer' ? 'contentinfo' :
+									   tag === 'aside' ? 'complementary' : 'region';
+					
+					result.landmarks.push({
+						role: implicitRole,
+						name: getAccessibleName(el),
+						selector: getSelector(el),
+						tag: tag
+					});
+				}
+			});
+		});
+	}
+	
+	// Extract interactive elements
+	function extractInteractive() {
+		const interactiveSelectors = [
+			'button', 'input', 'select', 'textarea', 'a[href]', 
+			'[role="button"]', '[role="link"]', '[role="menuitem"]', 
+			'[role="tab"]', '[role="checkbox"]', '[role="radio"]',
+			'[tabindex]:not([tabindex="-1"])', '[onclick]'
+		];
+		
+		interactiveSelectors.forEach(selector => {
+			document.querySelectorAll(selector).forEach(el => {
+				if (el.offsetParent !== null && !el.disabled) { // visible and enabled
+					const role = el.getAttribute('role') || 
+								(el.tagName === 'A' ? 'link' :
+								 el.tagName === 'BUTTON' ? 'button' :
+								 el.tagName === 'INPUT' ? el.type :
+								 el.tagName.toLowerCase());
+					
+					result.interactive.push({
+						role: role,
+						name: getAccessibleName(el),
+						selector: getSelector(el),
+						tag: el.tagName.toLowerCase(),
+						href: el.href || '',
+						value: el.value || ''
+					});
+				}
+			});
+		});
+	}
+	
+	// Extract headings
+	function extractHeadings() {
+		document.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]').forEach(el => {
+			if (el.offsetParent !== null && el.textContent.trim()) {
+				const level = el.tagName.match(/H(\d)/) ? el.tagName.charAt(1) : 
+							 el.getAttribute('aria-level') || '1';
+				
+				result.headings.push({
+					level: parseInt(level),
+					text: el.textContent.trim(),
+					selector: getSelector(el),
+					tag: el.tagName.toLowerCase()
+				});
+			}
+		});
+		
+		// Sort by document order
+		result.headings.sort((a, b) => {
+			const aEl = document.querySelector(a.selector);
+			const bEl = document.querySelector(b.selector);
+			return aEl && bEl ? (aEl.compareDocumentPosition(bEl) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1 : 0;
+		});
+	}
+	
+	// Extract content structure (simplified)
+	function extractContent() {
+		document.querySelectorAll('article, section, [role="article"], [role="region"]').forEach(el => {
+			if (el.offsetParent !== null) {
+				result.content.push({
+					role: el.getAttribute('role') || (el.tagName === 'ARTICLE' ? 'article' : 'region'),
+					name: getAccessibleName(el),
+					selector: getSelector(el),
+					tag: el.tagName.toLowerCase()
+				});
+			}
+		});
+	}
+	
+	// Execute based on focus
+	if (focus === 'all' || focus === 'landmarks') extractLandmarks();
+	if (focus === 'all' || focus === 'interactive') extractInteractive();
+	if (focus === 'all' || focus === 'headings') extractHeadings();
+	if (focus === 'all') extractContent();
+	
+	return result;
+}
+
+return extractARIASnapshot('` + focus + `');
+})();
+`
+
+	var ariaData map[string]interface{}
+	err := chromedp.Run(s.ctx, chromedp.Evaluate(js, &ariaData))
+	if err != nil {
+		return &mcp.CallToolResultFor[struct{}]{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("Error extracting ARIA snapshot: %v", err)},
+			},
+			IsError: true,
+		}, nil
+	}
+
+	// Format output based on request
+	var output string
+	switch format {
+	case "json":
+		if jsonBytes, err := json.MarshalIndent(ariaData, "", "  "); err == nil {
+			output = string(jsonBytes)
+		} else {
+			output = fmt.Sprintf("Error formatting JSON: %v", err)
+		}
+	case "debug":
+		output = fmt.Sprintf("ARIA Snapshot Debug:\n%+v", ariaData)
+	default: // llm-text
+		output = s.formatForLLM(ariaData)
+	}
+
+	return &mcp.CallToolResultFor[struct{}]{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: output},
+		},
+	}, nil
+}
+
+// formatForLLM converts the ARIA data into LLM-friendly text format
+func (s *CDPBrowserServer) formatForLLM(data map[string]interface{}) string {
+	var output strings.Builder
+
+	// Page information
+	if page, ok := data["page"].(map[string]interface{}); ok {
+		output.WriteString(fmt.Sprintf("PAGE: %s (%s)\n\n",
+			page["title"], page["url"]))
+	}
+
+	// Landmarks
+	if landmarks, ok := data["landmarks"].([]interface{}); ok && len(landmarks) > 0 {
+		output.WriteString("LANDMARKS:\n")
+		for _, item := range landmarks {
+			if landmark, ok := item.(map[string]interface{}); ok {
+				name := landmark["name"].(string)
+				role := landmark["role"].(string)
+				if name == "" {
+					name = fmt.Sprintf("<%s>", landmark["tag"].(string))
+				}
+				output.WriteString(fmt.Sprintf("• [%s] %s\n", role, name))
+			}
+		}
+		output.WriteString("\n")
+	}
+
+	// Interactive elements
+	if interactive, ok := data["interactive"].([]interface{}); ok && len(interactive) > 0 {
+		output.WriteString("INTERACTIVE ELEMENTS:\n")
+		for _, item := range interactive {
+			if elem, ok := item.(map[string]interface{}); ok {
+				name := elem["name"].(string)
+				role := elem["role"].(string)
+				selector := elem["selector"].(string)
+
+				if name == "" {
+					name = fmt.Sprintf("<%s>", elem["tag"].(string))
+				}
+
+				// Add href or value info if relevant
+				extra := ""
+				if href, exists := elem["href"].(string); exists && href != "" {
+					extra = fmt.Sprintf(" -> %s", href)
+				} else if value, exists := elem["value"].(string); exists && value != "" {
+					extra = fmt.Sprintf(" value=\"%s\"", value)
+				}
+
+				output.WriteString(fmt.Sprintf("• [%s] \"%s\"%s (selector: %s)\n",
+					role, name, extra, selector))
+			}
+		}
+		output.WriteString("\n")
+	}
+
+	// Headings
+	if headings, ok := data["headings"].([]interface{}); ok && len(headings) > 0 {
+		output.WriteString("HEADINGS:\n")
+		for _, item := range headings {
+			if heading, ok := item.(map[string]interface{}); ok {
+				level := int(heading["level"].(float64))
+				text := heading["text"].(string)
+				indent := strings.Repeat("  ", level-1)
+				output.WriteString(fmt.Sprintf("%s• [h%d] \"%s\"\n", indent, level, text))
+			}
+		}
+		output.WriteString("\n")
+	}
+
+	// Content structure
+	if content, ok := data["content"].([]interface{}); ok && len(content) > 0 {
+		output.WriteString("CONTENT STRUCTURE:\n")
+		for _, item := range content {
+			if section, ok := item.(map[string]interface{}); ok {
+				name := section["name"].(string)
+				role := section["role"].(string)
+				if name == "" {
+					name = fmt.Sprintf("<%s>", section["tag"].(string))
+				}
+				output.WriteString(fmt.Sprintf("• [%s] %s\n", role, name))
+			}
+		}
+		output.WriteString("\n")
+	}
+
+	return output.String()
+}
+
 // ShutdownServer tool - allows graceful server shutdown
 func (s *CDPBrowserServer) ShutdownServer(ctx context.Context, req *mcp.ServerRequest[*mcp.CallToolParamsFor[struct{}]]) (*mcp.CallToolResultFor[struct{}], error) {
 	log.Println("Shutdown requested via MCP tool")
@@ -421,6 +732,7 @@ func main() {
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "navigate", Description: "Navigate to a URL"}, server.Navigate)
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "click", Description: "Click on an element"}, server.Click)
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "screenshot", Description: "Take a screenshot"}, server.Screenshot)
+	mcp.AddTool(mcpServer, &mcp.Tool{Name: "aria_snapshot", Description: "Capture ARIA accessibility structure for LLM analysis"}, server.ARIASnapshot)
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "close_browser", Description: "Close the Chrome browser"}, server.CloseBrowser)
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "set_chrome_lifecycle", Description: "Control whether Chrome stays open when MCP server exits"}, server.SetChromeLifecycle)
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "shutdown_server", Description: "Gracefully shutdown the MCP server"}, server.ShutdownServer)

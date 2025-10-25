@@ -1,0 +1,4 @@
+navigate https://google.com
+wait 3
+aria-snapshot
+exit

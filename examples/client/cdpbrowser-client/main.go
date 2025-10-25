@@ -92,6 +92,17 @@ func main() {
 	case "screenshot":
 		screenshot(ctx, cs)
 
+	case "aria-snapshot":
+		format := "llm-text"
+		focus := "all"
+		if len(os.Args) > 2 {
+			format = os.Args[2]
+		}
+		if len(os.Args) > 3 {
+			focus = os.Args[3]
+		}
+		ariaSnapshot(ctx, cs, format, focus)
+
 	case "close":
 		closeBrowser(ctx, cs)
 
@@ -136,6 +147,7 @@ func printUsage() {
 	fmt.Println("  navigate <url>     - Navigate to a URL")
 	fmt.Println("  click <selector>   - Click on an element using CSS selector")
 	fmt.Println("  screenshot         - Take a screenshot of the current page")
+	fmt.Println("  aria-snapshot [format] [focus] - Capture ARIA accessibility structure")
 	fmt.Println("  close              - Close the browser")
 	fmt.Println("  lifecycle <bool>   - Set Chrome lifecycle (true=keep open, false=close on exit)")
 	fmt.Println("  list-tools         - List all available tools from the server")
@@ -147,6 +159,8 @@ func printUsage() {
 	fmt.Printf("  %s navigate https://example.com\n", os.Args[0])
 	fmt.Printf("  %s click \"button.submit\"\n", os.Args[0])
 	fmt.Printf("  %s screenshot\n", os.Args[0])
+	fmt.Printf("  %s aria-snapshot\n", os.Args[0])
+	fmt.Printf("  %s aria-snapshot json all\n", os.Args[0])
 	fmt.Printf("  %s interactive\n", os.Args[0])
 	fmt.Printf("  %s run-script actions.txt\n", os.Args[0])
 	fmt.Printf("  %s demo\n", os.Args[0])
@@ -196,6 +210,24 @@ func screenshot(ctx context.Context, cs *mcp.ClientSession) {
 
 	if err != nil {
 		log.Fatalf("Failed to call screenshot tool: %v", err)
+	}
+
+	printToolResult(result)
+}
+
+func ariaSnapshot(ctx context.Context, cs *mcp.ClientSession, format, focus string) {
+	fmt.Printf("Taking ARIA snapshot (format: %s, focus: %s)...\n", format, focus)
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "aria_snapshot",
+		Arguments: map[string]interface{}{
+			"format": format,
+			"focus":  focus,
+		},
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to call aria_snapshot tool: %v", err)
 	}
 
 	printToolResult(result)
@@ -305,6 +337,7 @@ func runInteractive(ctx context.Context, cs *mcp.ClientSession) {
 			fmt.Println("  navigate <url>     - Navigate to a URL")
 			fmt.Println("  click <selector>   - Click on an element")
 			fmt.Println("  screenshot         - Take a screenshot")
+			fmt.Println("  aria-snapshot [format] [focus] - Capture ARIA structure")
 			fmt.Println("  close              - Close browser")
 			fmt.Println("  lifecycle <bool>   - Set Chrome lifecycle")
 			fmt.Println("  list-tools         - List available tools")
@@ -327,6 +360,17 @@ func runInteractive(ctx context.Context, cs *mcp.ClientSession) {
 
 		case "screenshot":
 			screenshot(ctx, cs)
+
+		case "aria-snapshot":
+			format := "llm-text"
+			focus := "all"
+			if len(parts) > 1 {
+				format = parts[1]
+			}
+			if len(parts) > 2 {
+				focus = parts[2]
+			}
+			ariaSnapshot(ctx, cs, format, focus)
 
 		case "close":
 			closeBrowser(ctx, cs)
@@ -354,38 +398,38 @@ func runInteractive(ctx context.Context, cs *mcp.ClientSession) {
 
 func runScript(ctx context.Context, cs *mcp.ClientSession, scriptFile string) {
 	fmt.Printf("Running script file: %s\n", scriptFile)
-	
+
 	// Read the script file
 	file, err := os.Open(scriptFile)
 	if err != nil {
 		log.Fatalf("Failed to open script file %s: %v", scriptFile, err)
 	}
 	defer file.Close()
-	
+
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
-	
+
 	fmt.Println("Executing script commands...")
 	fmt.Println("=" + strings.Repeat("=", 50))
-	
+
 	for scanner.Scan() {
 		lineNum++
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		
+
 		fmt.Printf("Line %d: %s\n", lineNum, line)
-		
+
 		parts := strings.Fields(line)
 		if len(parts) == 0 {
 			continue
 		}
-		
+
 		command := parts[0]
-		
+
 		switch command {
 		case "navigate":
 			if len(parts) < 2 {
@@ -393,20 +437,31 @@ func runScript(ctx context.Context, cs *mcp.ClientSession, scriptFile string) {
 				continue
 			}
 			navigate(ctx, cs, parts[1])
-			
+
 		case "click":
 			if len(parts) < 2 {
 				fmt.Printf("  Error: click requires CSS selector (line %d)\n", lineNum)
 				continue
 			}
 			click(ctx, cs, parts[1])
-			
+
 		case "screenshot":
 			screenshot(ctx, cs)
-			
+
+		case "aria-snapshot":
+			format := "llm-text"
+			focus := "all"
+			if len(parts) > 1 {
+				format = parts[1]
+			}
+			if len(parts) > 2 {
+				focus = parts[2]
+			}
+			ariaSnapshot(ctx, cs, format, focus)
+
 		case "close":
 			closeBrowser(ctx, cs)
-			
+
 		case "lifecycle":
 			if len(parts) < 2 {
 				fmt.Printf("  Error: lifecycle requires boolean value (line %d)\n", lineNum)
@@ -418,10 +473,10 @@ func runScript(ctx context.Context, cs *mcp.ClientSession, scriptFile string) {
 				continue
 			}
 			setLifecycle(ctx, cs, keepOpen)
-			
+
 		case "list-tools":
 			listTools(ctx, cs)
-			
+
 		case "wait":
 			// Optional wait command for delays between actions
 			if len(parts) < 2 {
@@ -435,18 +490,18 @@ func runScript(ctx context.Context, cs *mcp.ClientSession, scriptFile string) {
 			}
 			fmt.Printf("  Waiting %d seconds...\n", seconds)
 			time.Sleep(time.Duration(seconds) * time.Second)
-			
+
 		default:
 			fmt.Printf("  Error: unknown command '%s' (line %d)\n", command, lineNum)
 		}
-		
+
 		fmt.Println() // Add spacing between commands
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		log.Fatalf("Error reading script file: %v", err)
 	}
-	
+
 	fmt.Println("=" + strings.Repeat("=", 50))
 	fmt.Println("Script execution completed")
 }

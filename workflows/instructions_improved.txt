@@ -1,0 +1,32 @@
+We need to perform the below set of steps to create images using CanvaAI.
+
+**IMPORTANT: Execute steps sequentially. Only proceed to the next step when the current step is completely finished.**
+
+1. **Navigate to Canva.com**  
+   - Open the browser and go to [https://www.canva.com](https://www.canva.com).  
+   - Ensure the page is fully loaded before proceeding.
+   - THEN proceed to Step 2.
+
+2. **Click on the Canva AI Button**  
+   - Take an ARIA snapshot to locate the "Canva AI" button.
+   - Click on the "Canva AI" button using the selector you found in the ARIA snapshot.
+   - Wait for the Canva AI interface to load completely.
+   - Take an ARIA snapshot to verify the AI interface has loaded.
+   - THEN proceed to Step 3.
+
+3. **Enter Text in the AI Text Box**  
+   - Take an ARIA snapshot of the Canva AI interface.
+   - Locate the text input field with placeholder text "Describe your idea, and I'll bring it to life".
+   - Enter the text `Moonlit Sunset` into this text box.
+   - THEN proceed to Step 4.
+
+4. **Submit the Request**  
+   - Locate the submit button (may be labeled "->", "Generate", "Create", or similar).
+   - Click on it to submit the input.
+   - Wait for the AI to generate the response or output.
+   - Take a screenshot to capture the results.
+
+**CRITICAL RULES:**
+- Always take an ARIA snapshot before trying to interact with elements.
+- Use the exact selectors found in the ARIA snapshot.
+- Complete each step fully before moving to the next.

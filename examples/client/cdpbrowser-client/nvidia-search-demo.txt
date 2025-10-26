@@ -1,0 +1,25 @@
+# Extended Google Search Demo - Search for "NVidia"
+# This demonstrates the complete workflow with longer timeouts
+
+# Step 1: Navigate to Google
+navigate https://google.com
+wait 3
+
+# Step 2: Discover all interactive elements first
+aria-snapshot llm-text interactive
+wait 1
+
+# Step 3: Type "NVidia" in the search box using discovered selector
+type-text "#APjFqb" "NVidia"
+wait 2
+
+# Step 4: Click the Google Search button
+click-button "Google Search"
+wait 5
+
+# Step 5: Take screenshot of search results
+screenshot
+wait 1
+
+# Step 6: Get ARIA snapshot of search results page to see what we found
+aria-snapshot llm-text interactive

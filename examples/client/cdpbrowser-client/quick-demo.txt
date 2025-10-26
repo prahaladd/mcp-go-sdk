@@ -1,0 +1,4 @@
+# Quick Element Discovery Demo
+navigate https://google.com
+wait 1
+aria-snapshot llm-text interactive

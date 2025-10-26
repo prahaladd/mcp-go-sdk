@@ -1,0 +1,3 @@
+navigate https://google.com
+wait 2
+aria-snapshot llm-text interactive

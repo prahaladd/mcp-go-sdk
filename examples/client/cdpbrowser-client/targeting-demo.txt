@@ -1,0 +1,15 @@
+# Simple Element Targeting Demo - Show Multiple Ways to Target the Same Element
+navigate https://google.com
+wait 2
+
+# Method 1: Using exact CSS selector discovered from ARIA snapshot
+# We know from our previous test that the search box is: #APjFqb
+
+# Method 2: Using ARIA label (natural language)
+# We saw it has ARIA label "Search"
+
+# Method 3: Using partial CSS selector
+# We could use textarea[name="q"] or just "q"
+
+# Let's test our smart targeting with the search box
+aria-snapshot llm-text interactive

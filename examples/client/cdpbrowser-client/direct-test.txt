@@ -1,0 +1,8 @@
+# Very Simple Google Search Demo - Direct Selectors Only
+navigate https://google.com
+wait 3
+type-text "#APjFqb" "NVidia"
+wait 2
+click-button "input[name=\"btnK\"]"
+wait 3
+screenshot

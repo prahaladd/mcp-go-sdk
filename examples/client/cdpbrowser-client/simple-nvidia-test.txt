@@ -1,0 +1,8 @@
+# Simple NVidia Search Test - Using Native CDP Targeting
+navigate https://google.com
+wait 2
+type-text "APjFqb" "NVidia"
+wait 1
+click-button "Google Search"
+wait 3
+screenshot

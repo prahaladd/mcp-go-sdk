@@ -103,6 +103,52 @@ func main() {
 		}
 		ariaSnapshot(ctx, cs, format, focus)
 
+	case "type-text":
+		if len(os.Args) < 4 {
+			fmt.Fprintf(os.Stderr, "Usage: %s type-text <selector> <text> [clear]\n", os.Args[0])
+			os.Exit(1)
+		}
+		clear := false
+		if len(os.Args) > 4 {
+			clear = os.Args[4] == "true"
+		}
+		typeText(ctx, cs, os.Args[2], os.Args[3], clear)
+
+	case "click-button":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: %s click-button <selector>\n", os.Args[0])
+			os.Exit(1)
+		}
+		clickButton(ctx, cs, os.Args[2])
+
+	case "click-link":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: %s click-link <selector>\n", os.Args[0])
+			os.Exit(1)
+		}
+		clickLink(ctx, cs, os.Args[2])
+
+	case "select-dropdown":
+		if len(os.Args) < 4 {
+			fmt.Fprintf(os.Stderr, "Usage: %s select-dropdown <selector> <value>\n", os.Args[0])
+			os.Exit(1)
+		}
+		selectDropdown(ctx, cs, os.Args[2], os.Args[3])
+
+	case "choose-option":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: %s choose-option <selector> [checked]\n", os.Args[0])
+			os.Exit(1)
+		}
+		checked := true
+		if len(os.Args) > 3 {
+			checked = os.Args[3] == "true"
+		}
+		chooseOption(ctx, cs, os.Args[2], checked)
+
+	case "refresh":
+		refreshPage(ctx, cs)
+
 	case "close":
 		closeBrowser(ctx, cs)
 
@@ -148,6 +194,12 @@ func printUsage() {
 	fmt.Println("  click <selector>   - Click on an element using CSS selector")
 	fmt.Println("  screenshot         - Take a screenshot of the current page")
 	fmt.Println("  aria-snapshot [format] [focus] - Capture ARIA accessibility structure")
+	fmt.Println("  type-text <selector> <text> [clear] - Type text into an input field")
+	fmt.Println("  click-button <selector> - Click a button element")
+	fmt.Println("  click-link <selector> - Click a link element")
+	fmt.Println("  select-dropdown <selector> <value> - Select an option from a dropdown")
+	fmt.Println("  choose-option <selector> [checked] - Check/uncheck a radio button or checkbox")
+	fmt.Println("  refresh            - Refresh the current page")
 	fmt.Println("  close              - Close the browser")
 	fmt.Println("  lifecycle <bool>   - Set Chrome lifecycle (true=keep open, false=close on exit)")
 	fmt.Println("  list-tools         - List all available tools from the server")
@@ -160,7 +212,10 @@ func printUsage() {
 	fmt.Printf("  %s click \"button.submit\"\n", os.Args[0])
 	fmt.Printf("  %s screenshot\n", os.Args[0])
 	fmt.Printf("  %s aria-snapshot\n", os.Args[0])
-	fmt.Printf("  %s aria-snapshot json all\n", os.Args[0])
+	fmt.Printf("  %s type-text \"#email\" \"user@example.com\"\n", os.Args[0])
+	fmt.Printf("  %s click-button \"Submit\"\n", os.Args[0])
+	fmt.Printf("  %s select-dropdown \"country\" \"United States\"\n", os.Args[0])
+	fmt.Printf("  %s choose-option \"newsletter\" true\n", os.Args[0])
 	fmt.Printf("  %s interactive\n", os.Args[0])
 	fmt.Printf("  %s run-script actions.txt\n", os.Args[0])
 	fmt.Printf("  %s demo\n", os.Args[0])
@@ -228,6 +283,110 @@ func ariaSnapshot(ctx context.Context, cs *mcp.ClientSession, format, focus stri
 
 	if err != nil {
 		log.Fatalf("Failed to call aria_snapshot tool: %v", err)
+	}
+
+	printToolResult(result)
+}
+
+func typeText(ctx context.Context, cs *mcp.ClientSession, selector, text string, clear bool) {
+	fmt.Printf("Typing text \"%s\" into element: %s (clear: %t)\n", text, selector, clear)
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "type_text",
+		Arguments: map[string]interface{}{
+			"selector": selector,
+			"text":     text,
+			"clear":    clear,
+		},
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to call type_text tool: %v", err)
+	}
+
+	printToolResult(result)
+}
+
+func clickButton(ctx context.Context, cs *mcp.ClientSession, selector string) {
+	fmt.Printf("Clicking button: %s\n", selector)
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "click_button",
+		Arguments: map[string]interface{}{
+			"selector": selector,
+		},
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to call click_button tool: %v", err)
+	}
+
+	printToolResult(result)
+}
+
+func clickLink(ctx context.Context, cs *mcp.ClientSession, selector string) {
+	fmt.Printf("Clicking link: %s\n", selector)
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "click_link",
+		Arguments: map[string]interface{}{
+			"selector": selector,
+		},
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to call click_link tool: %v", err)
+	}
+
+	printToolResult(result)
+}
+
+func selectDropdown(ctx context.Context, cs *mcp.ClientSession, selector, value string) {
+	fmt.Printf("Selecting \"%s\" from dropdown: %s\n", value, selector)
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "select_dropdown",
+		Arguments: map[string]interface{}{
+			"selector": selector,
+			"value":    value,
+		},
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to call select_dropdown tool: %v", err)
+	}
+
+	printToolResult(result)
+}
+
+func chooseOption(ctx context.Context, cs *mcp.ClientSession, selector string, checked bool) {
+	fmt.Printf("Setting option %s to %t\n", selector, checked)
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "choose_option",
+		Arguments: map[string]interface{}{
+			"selector": selector,
+			"checked":  checked,
+		},
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to call choose_option tool: %v", err)
+	}
+
+	printToolResult(result)
+}
+
+func refreshPage(ctx context.Context, cs *mcp.ClientSession) {
+	fmt.Println("Refreshing page...")
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "refresh_page",
+		Arguments: map[string]interface{}{},
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to call refresh_page tool: %v", err)
 	}
 
 	printToolResult(result)
@@ -338,6 +497,12 @@ func runInteractive(ctx context.Context, cs *mcp.ClientSession) {
 			fmt.Println("  click <selector>   - Click on an element")
 			fmt.Println("  screenshot         - Take a screenshot")
 			fmt.Println("  aria-snapshot [format] [focus] - Capture ARIA structure")
+			fmt.Println("  type-text <selector> <text> [clear] - Type text into an input field")
+			fmt.Println("  click-button <selector> - Click a button element")
+			fmt.Println("  click-link <selector> - Click a link element")
+			fmt.Println("  select-dropdown <selector> <value> - Select dropdown option")
+			fmt.Println("  choose-option <selector> [checked] - Check/uncheck option")
+			fmt.Println("  refresh            - Refresh the current page")
 			fmt.Println("  close              - Close browser")
 			fmt.Println("  lifecycle <bool>   - Set Chrome lifecycle")
 			fmt.Println("  list-tools         - List available tools")
@@ -372,6 +537,60 @@ func runInteractive(ctx context.Context, cs *mcp.ClientSession) {
 			}
 			ariaSnapshot(ctx, cs, format, focus)
 
+		case "type-text":
+			if len(parts) < 3 {
+				fmt.Println("Usage: type-text <selector> <text> [clear]")
+				continue
+			}
+			clear := false
+			if len(parts) > 3 {
+				clear = parts[3] == "true"
+			}
+			// Join all parts from index 2 onwards to handle text with spaces
+			text := strings.Join(parts[2:len(parts)], " ")
+			if len(parts) > 3 && parts[len(parts)-1] == "true" {
+				text = strings.Join(parts[2:len(parts)-1], " ")
+				clear = true
+			}
+			typeText(ctx, cs, parts[1], text, clear)
+
+		case "click-button":
+			if len(parts) < 2 {
+				fmt.Println("Usage: click-button <selector>")
+				continue
+			}
+			clickButton(ctx, cs, parts[1])
+
+		case "click-link":
+			if len(parts) < 2 {
+				fmt.Println("Usage: click-link <selector>")
+				continue
+			}
+			clickLink(ctx, cs, parts[1])
+
+		case "select-dropdown":
+			if len(parts) < 3 {
+				fmt.Println("Usage: select-dropdown <selector> <value>")
+				continue
+			}
+			// Join all parts from index 2 onwards to handle values with spaces
+			value := strings.Join(parts[2:], " ")
+			selectDropdown(ctx, cs, parts[1], value)
+
+		case "choose-option":
+			if len(parts) < 2 {
+				fmt.Println("Usage: choose-option <selector> [checked]")
+				continue
+			}
+			checked := true
+			if len(parts) > 2 {
+				checked = parts[2] == "true"
+			}
+			chooseOption(ctx, cs, parts[1], checked)
+
+		case "refresh":
+			refreshPage(ctx, cs)
+
 		case "close":
 			closeBrowser(ctx, cs)
 
@@ -389,6 +608,19 @@ func runInteractive(ctx context.Context, cs *mcp.ClientSession) {
 
 		case "list-tools":
 			listTools(ctx, cs)
+
+		case "wait":
+			if len(parts) < 2 {
+				fmt.Println("Usage: wait <seconds>")
+				continue
+			}
+			seconds, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Printf("Invalid wait duration: %s\n", parts[1])
+				continue
+			}
+			fmt.Printf("Waiting %d seconds...\n", seconds)
+			time.Sleep(time.Duration(seconds) * time.Second)
 
 		default:
 			fmt.Printf("Unknown command: %s (type 'help' for available commands)\n", command)
@@ -458,6 +690,56 @@ func runScript(ctx context.Context, cs *mcp.ClientSession, scriptFile string) {
 				focus = parts[2]
 			}
 			ariaSnapshot(ctx, cs, format, focus)
+
+		case "type-text":
+			if len(parts) < 3 {
+				fmt.Printf("  Error: type-text requires selector and text (line %d)\n", lineNum)
+				continue
+			}
+			clear := false
+			text := strings.Join(parts[2:], " ")
+			// Check if last argument is "true" for clear flag
+			if len(parts) > 3 && parts[len(parts)-1] == "true" {
+				text = strings.Join(parts[2:len(parts)-1], " ")
+				clear = true
+			}
+			typeText(ctx, cs, parts[1], text, clear)
+
+		case "click-button":
+			if len(parts) < 2 {
+				fmt.Printf("  Error: click-button requires selector (line %d)\n", lineNum)
+				continue
+			}
+			clickButton(ctx, cs, parts[1])
+
+		case "click-link":
+			if len(parts) < 2 {
+				fmt.Printf("  Error: click-link requires selector (line %d)\n", lineNum)
+				continue
+			}
+			clickLink(ctx, cs, parts[1])
+
+		case "select-dropdown":
+			if len(parts) < 3 {
+				fmt.Printf("  Error: select-dropdown requires selector and value (line %d)\n", lineNum)
+				continue
+			}
+			value := strings.Join(parts[2:], " ")
+			selectDropdown(ctx, cs, parts[1], value)
+
+		case "choose-option":
+			if len(parts) < 2 {
+				fmt.Printf("  Error: choose-option requires selector (line %d)\n", lineNum)
+				continue
+			}
+			checked := true
+			if len(parts) > 2 {
+				checked = parts[2] == "true"
+			}
+			chooseOption(ctx, cs, parts[1], checked)
+
+		case "refresh":
+			refreshPage(ctx, cs)
 
 		case "close":
 			closeBrowser(ctx, cs)

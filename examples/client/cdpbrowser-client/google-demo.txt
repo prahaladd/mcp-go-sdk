@@ -1,0 +1,26 @@
+# Google.com Form Filling Demo Script
+# This demonstrates the complete workflow for element discovery and interaction
+
+# Step 1: Navigate to Google
+navigate https://google.com
+wait 2
+
+# Step 2: Discover all interactive elements
+aria-snapshot llm-text interactive
+
+# Step 3: Type search query using discovered selector
+type-text "#APjFqb" "model context protocol"
+wait 1
+
+# Step 4: Click search using discovered selector  
+click-button "Google Search"
+wait 3
+
+# Step 5: Take screenshot of results
+screenshot
+
+# Alternative targeting methods demo:
+# navigate https://google.com
+# wait 2
+# type-text "Search" "hello world"  # Using ARIA label
+# click-button "btnK"               # Using name attribute

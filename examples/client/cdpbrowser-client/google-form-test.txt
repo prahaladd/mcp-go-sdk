@@ -1,0 +1,31 @@
+# Test script for Google.com form interaction
+# This demonstrates the typical workflow: navigate -> discover -> interact
+
+# Step 1: Navigate to Google
+navigate https://google.com
+wait 3
+
+# Step 2: Use ARIA snapshot to discover available elements
+aria-snapshot llm-text interactive
+
+# Step 3: Type in the search box (using various selector strategies)
+# Google's search box can be targeted in multiple ways:
+type-text "Search" "MCP browser automation" 
+# Alternative selectors that should work:
+# type-text "q" "MCP browser automation"
+# type-text "[name='q']" "MCP browser automation" 
+# type-text "textarea[name='q']" "MCP browser automation"
+
+wait 2
+
+# Step 4: Click the search button (or we could press Enter)
+click-button "Google Search"
+# Alternative: click-button "[name='btnK']"
+
+wait 3
+
+# Step 5: Take a screenshot to see the results
+screenshot
+
+# Step 6: Take another ARIA snapshot to see the results page structure
+aria-snapshot llm-text landmarks

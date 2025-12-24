@@ -1,0 +1,1 @@
+Navigate to Google.com and search for "ChromaDB vector database"

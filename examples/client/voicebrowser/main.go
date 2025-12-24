@@ -8,15 +8,21 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
+	chroma "github.com/amikos-tech/chroma-go/pkg/api/v2"
+	defaultef "github.com/amikos-tech/chroma-go/pkg/embeddings/default_ef"
+	"github.com/modelcontextprotocol/go-sdk/examples/client/voicebrowser/chromadb"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -24,8 +30,233 @@ import (
 // Global MCP session for tool execution
 var globalMCPSession *mcp.ClientSession
 
+// Global ChromaDB state
+var (
+	globalChromaClient     *chromadb.Client
+	globalChromaCollection chroma.Collection
+	globalSessionID        string
+	currentPageURL         string
+	totalElementsStored    int
+)
+
 // Global flag to track if initial login prompt has been shown
 var initialLoginPromptShown bool = false
+
+// AriaElement represents a parsed HTML element from ARIA snapshot
+type AriaElement struct {
+	ElementType     string
+	DisplayText     string
+	AriaLabel       string
+	PrimarySelector string
+	AltSelector     string
+}
+
+// Step represents a parsed execution step for ChromaDB-driven workflow
+type Step struct {
+	ToolName     string
+	Description  string
+	OriginalLine string
+}
+
+// generateSessionID creates a unique session identifier
+func generateSessionID() string {
+	return fmt.Sprintf("%d", time.Now().Unix())
+}
+
+// generateElementID creates a unique ID for an ARIA element
+func generateElementID(url, elementType, displayText, timestamp string, index int) string {
+	data := url + ":" + elementType + ":" + displayText + ":" + timestamp + ":" + fmt.Sprintf("%d", index)
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
+}
+
+// parseAriaSnapshot parses ARIA snapshot text and extracts elements
+func parseAriaSnapshot(ariaText string) ([]AriaElement, error) {
+	var elements []AriaElement
+
+	// Split by bullet points
+	lines := strings.Split(ariaText, "•")
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// Extract element type [button], [link], etc.
+		// Handles both "[Type]" and "[Scope] [Type]"
+		// Group 1: First bracket, Group 2: Second bracket (optional), Group 3: Display text
+		typeRe := regexp.MustCompile(`(\[[^\]]+\])\s*(?:(\[[^\]]+\])\s*)?"([^"]+)"`)
+		typeMatch := typeRe.FindStringSubmatch(line)
+		
+		elementType := ""
+		displayText := ""
+		
+		if typeMatch != nil {
+			if typeMatch[2] != "" {
+				// Two brackets: [Scope] [Type]
+				elementType = strings.Trim(typeMatch[2], "[]")
+			} else {
+				// One bracket: [Type]
+				elementType = strings.Trim(typeMatch[1], "[]")
+			}
+			displayText = typeMatch[3]
+		} else {
+			// Fallback for lines that might not match the full pattern
+			simpleRe := regexp.MustCompile(`\[([^\]]+)\]`)
+			if m := simpleRe.FindStringSubmatch(line); m != nil {
+				elementType = m[1]
+			}
+			displayRe := regexp.MustCompile(`"([^"]+)"`)
+			if m := displayRe.FindStringSubmatch(line); m != nil {
+				displayText = m[1]
+			}
+		}
+
+		if elementType == "" || displayText == "" {
+			continue
+		}
+
+		// Extract aria-label
+		ariaRe := regexp.MustCompile(`aria-label:\s*"([^"]+)"`)
+		ariaMatch := ariaRe.FindStringSubmatch(line)
+		ariaLabel := ""
+		if ariaMatch != nil {
+			ariaLabel = ariaMatch[1]
+		}
+
+		// Extract primary selector
+		// Handles: " (selector: .class-name)" or " (selector: input[type="text"])"
+		primaryRe := regexp.MustCompile(`(?i)selector:\s*(.+?)(?:\s*\)|$)`)
+		primaryMatch := primaryRe.FindStringSubmatch(line)
+		primarySelector := ""
+		if primaryMatch != nil {
+			primarySelector = strings.TrimSpace(primaryMatch[1])
+			// If it ends with a bracket from the outer (selector: ...), trim it
+			// but be careful not to trim a bracket that belongs to the selector itself
+			if strings.HasSuffix(primarySelector, ")") && strings.Count(primarySelector, "(") < strings.Count(primarySelector, ")") {
+				primarySelector = strings.TrimSuffix(primarySelector, ")")
+			}
+		}
+
+		// Extract alternative selector
+		altRe := regexp.MustCompile(`(?i)Alternative selectors?:\s*([^\n\r]+)`)
+		altMatch := altRe.FindStringSubmatch(line)
+		altSelector := ""
+		if altMatch != nil {
+			altSelector = strings.TrimSpace(altMatch[1])
+		}
+
+		elements = append(elements, AriaElement{
+			ElementType:     elementType,
+			DisplayText:     displayText,
+			AriaLabel:       ariaLabel,
+			PrimarySelector: primarySelector,
+			AltSelector:     altSelector,
+		})
+	}
+
+	return elements, nil
+}
+
+// initializeChromaDB creates ChromaDB client and collection
+func initializeChromaDB(ctx context.Context, chromaURL string) (*chromadb.Client, chroma.Collection, error) {
+	// Generate unique session ID
+	sessionID := generateSessionID()
+	globalSessionID = sessionID
+
+	// Create ChromaDB client
+	client, err := chromadb.NewClient(ctx, chromaURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to ChromaDB at %s: %w", chromaURL, err)
+	}
+
+	// Create embedding function
+	ef, _, err := defaultef.NewDefaultEmbeddingFunction()
+	if err != nil {
+		client.Close()
+		return nil, nil, fmt.Errorf("failed to create embedding function: %w", err)
+	}
+
+	// Create collection
+	collectionName := fmt.Sprintf("voicebrowser-session-%s", sessionID)
+	collection, err := client.CreateCollection(collectionName, ef)
+	if err != nil {
+		client.Close()
+		return nil, nil, fmt.Errorf("failed to create collection %s: %w", collectionName, err)
+	}
+
+	return client, collection, nil
+}
+
+// persistAriaSnapshot parses and stores ARIA snapshot in ChromaDB
+func persistAriaSnapshot(ctx context.Context, ariaData string, url string) error {
+	startTime := time.Now()
+
+	// Try to extract URL from snapshot header if present
+	// Format 1: [Page Structure] - https://example.com (Legacy)
+	// Format 2: ARIA SNAPSHOT (URL: https://example.com) (New)
+	urlRegex := regexp.MustCompile(`(?:\[Page Structure\] - |ARIA SNAPSHOT \(URL: )(https?://[^\s\n\)]+)`)
+	if matches := urlRegex.FindStringSubmatch(ariaData); len(matches) > 1 {
+		url = matches[1]
+		currentPageURL = url // Update global state too
+		fmt.Printf("📍 URL updated from snapshot: %s\n", url)
+	}
+
+	// Parse ARIA snapshot
+	elements, err := parseAriaSnapshot(ariaData)
+	if err != nil {
+		return fmt.Errorf("failed to parse ARIA snapshot: %w", err)
+	}
+
+	if len(elements) == 0 {
+		log.Printf("DEBUG: parseAriaSnapshot failed to parse any elements. Raw text length: %d", len(ariaData))
+		if len(ariaData) > 0 {
+			log.Printf("DEBUG: Raw text start: %s", truncateString(ariaData, 200))
+		}
+		return fmt.Errorf("no elements parsed from ARIA snapshot")
+	}
+
+	// Build ChromaDB documents
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	documents := make([]string, len(elements))
+	metadatas := make([]chroma.DocumentMetadata, len(elements))
+	ids := make([]string, len(elements))
+
+	for i, elem := range elements {
+		// Document: display text for semantic search
+		documents[i] = elem.DisplayText
+
+		// Metadata: all element details
+		metadatas[i] = chroma.NewMetadata(
+			chroma.NewStringAttribute("element_type", elem.ElementType),
+			chroma.NewStringAttribute("aria_label", elem.AriaLabel),
+			chroma.NewStringAttribute("primary_selector", elem.PrimarySelector),
+			chroma.NewStringAttribute("alt_selector", elem.AltSelector),
+			chroma.NewStringAttribute("url", url),
+			chroma.NewStringAttribute("timestamp", timestamp),
+			chroma.NewStringAttribute("session_id", globalSessionID),
+		)
+
+		// ID: hash of URL + element details + timestamp + index (ensures uniqueness)
+		ids[i] = generateElementID(url, elem.ElementType, elem.DisplayText, timestamp, i)
+	}
+
+	// Add to ChromaDB - SYNCHRONOUS
+	err = globalChromaClient.AddDocuments(globalChromaCollection, documents, metadatas, ids)
+	if err != nil {
+		return fmt.Errorf("failed to add documents to ChromaDB: %w", err)
+	}
+
+	// Update session metrics
+	totalElementsStored += len(elements)
+
+	duration := time.Since(startTime)
+	fmt.Printf("✓ Persisted %d ARIA elements from %s (took %v)\n",
+		len(elements), url, duration.Round(time.Millisecond))
+	fmt.Printf("📊 Session total: %d elements stored\n", totalElementsStored)
+
+	return nil
+}
 
 // loadEnvFile loads environment variables from a file
 func loadEnvFile(envFilePath string) error {
@@ -89,9 +320,15 @@ func main() {
 	var filePath string
 	var cdpbrowserPath string
 	var envFilePath string
+	var chromaDBURL string
+	var enableChromaDB bool
+	var executionMode string
 	flag.StringVar(&filePath, "file", "", "Path to a file whose content will be sent to OpenAI")
 	flag.StringVar(&cdpbrowserPath, "cdpbrowser", "../server/cdpbrowser/cdpbrowser", "Path to the cdpbrowser server executable")
 	flag.StringVar(&envFilePath, "env", "", "Path to environment file containing API keys (e.g., .vscode/voicebrowser.env)")
+	flag.StringVar(&chromaDBURL, "chromadb", "http://localhost:8000", "ChromaDB server URL")
+	flag.BoolVar(&enableChromaDB, "enable-chromadb", true, "Enable ChromaDB persistence (default: true)")
+	flag.StringVar(&executionMode, "execution-mode", "llm-driven", "Execution mode: 'llm-driven' (default) or 'chromadb-driven'")
 	flag.Parse()
 
 	// Load environment variables from file if specified
@@ -132,6 +369,30 @@ func main() {
 
 	fmt.Println("Connected to cdpbrowser server successfully")
 
+	// Initialize ChromaDB if enabled
+	if enableChromaDB {
+		fmt.Printf("\nInitializing ChromaDB connection...\n")
+		chromaClient, collection, err := initializeChromaDB(ctx, chromaDBURL)
+		if err != nil {
+			log.Fatalf("FATAL: ChromaDB initialization failed: %v\nPlease ensure ChromaDB is running at %s", err, chromaDBURL)
+		}
+		globalChromaClient = chromaClient
+		globalChromaCollection = collection
+		fmt.Printf("✓ ChromaDB connected: %s\n", chromaDBURL)
+		fmt.Printf("✓ Collection: %s\n", collection.Name())
+
+		// Cleanup on exit
+		defer func() {
+			if globalChromaClient != nil {
+				fmt.Printf("\n✓ ChromaDB session collection: voicebrowser-session-%s\n", globalSessionID)
+				fmt.Println("  (Collection persisted for future analysis)")
+				globalChromaClient.Close()
+			}
+		}()
+	} else {
+		fmt.Println("\n⚠️  ChromaDB persistence disabled")
+	}
+
 	// Get available tools
 	tools := listTools(ctx, session)
 
@@ -154,7 +415,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error reading file %s: %v", filePath, err)
 		}
-		message = fmt.Sprintf("Here's a document that contains a numbered sequence of steps between {steps} and {/steps} delimiters, that require to be automated.\n\n{steps}%s{/steps}\n\nAnalyze one step at a time and return the next step to be performed. Think step by step. Use the cdpbrowser tools provided.\n", string(content))
+		message = string(content)
 		fmt.Printf("Using content from file: %s\n", filePath)
 	} else {
 		// Use default message focused on element discovery
@@ -162,14 +423,53 @@ func main() {
 		fmt.Println("Using default demonstration message")
 	}
 
-	// Send request to OpenAI with verified browser tools
-	resp, err := sendChatRequest(ctx, openaiClient, message, tools)
-	if err != nil {
-		log.Fatalf("Error calling OpenAI API: %v", err)
+	// Route to appropriate execution mode
+	var resp string
+	if executionMode == "chromadb-driven" {
+		fmt.Println("\n🔄 Using ChromaDB-driven execution mode")
+		resp, err = runChromaDBDrivenWorkflow(ctx, openaiClient, session, message, tools)
+		if err != nil {
+			log.Fatalf("Error in ChromaDB-driven workflow: %v", err)
+		}
+	} else {
+		fmt.Println("\n🔄 Using LLM-driven execution mode")
+		resp, err = runLLMDrivenWorkflow(ctx, openaiClient, message, tools)
+		if err != nil {
+			log.Fatalf("Error in LLM-driven workflow: %v", err)
+		}
 	}
 
-	fmt.Println("\nOpenAI Response:")
+	fmt.Println("\nWorkflow Response:")
 	fmt.Println(resp)
+
+	// Wait for user input before closing to allow viewing results
+	fmt.Println("\n" + strings.Repeat("━", 70))
+	fmt.Println("🏁 WORKFLOW FINISHED")
+	fmt.Println(strings.Repeat("━", 70))
+	fmt.Printf("The automation has completed all steps.\n")
+	fmt.Printf("You can now inspect the browser window.\n")
+	fmt.Print("→ Press ENTER to close the browser and exit: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	_, _ = reader.ReadString('\n')
+	fmt.Println("👋 Exiting...")
+}
+
+// runLLMDrivenWorkflow executes the original LLM-driven automation workflow
+func runLLMDrivenWorkflow(ctx context.Context, openaiClient *openai.Client, message string, tools []*mcp.Tool) (string, error) {
+	// Original behavior - format message for step-by-step analysis if from file
+	formattedMessage := message
+	if strings.Contains(message, "\n") && !strings.Contains(message, "Please demonstrate") {
+		formattedMessage = fmt.Sprintf("Here's a document that contains a numbered sequence of steps between {steps} and {/steps} delimiters, that require to be automated.\n\n{steps}%s{/steps}\n\nAnalyze one step at a time and return the next step to be performed. Think step by step. Use the cdpbrowser tools provided.\n", message)
+	}
+
+	// Send request to OpenAI with verified browser tools
+	resp, err := sendChatRequest(ctx, openaiClient, formattedMessage, tools)
+	if err != nil {
+		return "", fmt.Errorf("error calling OpenAI API: %v", err)
+	}
+
+	return resp, nil
 }
 
 // List available tools from the MCP server
@@ -199,6 +499,7 @@ func verifyCDPBrowserTools(ctx context.Context, session *mcp.ClientSession) []*m
 		"click",
 		"screenshot",
 		"aria_snapshot",
+		"aria_snapshot_v2",
 		"type_text",
 		"click_button",
 		"click_link",
@@ -295,6 +596,26 @@ func convertToOpenAITools(mcpTools []*mcp.Tool) []openai.Tool {
 		tools = append(tools, tool)
 	}
 
+	// Add the workflow_complete pseudo-tool
+	workflowCompleteTool := openai.Tool{
+		Type: "function",
+		Function: &openai.FunctionDefinition{
+			Name:        "workflow_complete",
+			Description: "Call this tool when the automation workflow is completely finished and no further actions are needed. This signals the end of the automation session.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"message": map[string]interface{}{
+						"type":        "string",
+						"description": "A message indicating the completion status and results",
+					},
+				},
+				"required": []string{"message"},
+			},
+		},
+	}
+	tools = append(tools, workflowCompleteTool)
+
 	return tools
 }
 
@@ -333,7 +654,8 @@ func sendChatRequest(ctx context.Context, client *openai.Client, userMessage str
 				"1. Use 'navigate' to go to websites\n" +
 				"2. Use 'aria_snapshot' to understand page structure and find element selectors\n" +
 				"3. Use element interaction tools (type_text, click_button, click_link, etc.) with the selectors you found\n" +
-				"4. Use 'screenshot' to capture results when helpful\n\n" +
+				"4. Use 'screenshot' to capture results when helpful\n" +
+				"5. CALL 'workflow_complete' when the automation workflow is finished\n\n" +
 				"For element selection:\n" +
 				"- CSS selectors like 'input[name=\"q\"]' for Google search\n" +
 				"- ARIA selectors like 'button[aria-label=\"Search\"]'\n" +
@@ -345,7 +667,12 @@ func sendChatRequest(ctx context.Context, client *openai.Client, userMessage str
 				"If you find the element, USE IT IMMEDIATELY - don't ignore it or claim it doesn't exist.\n\n" +
 				"Always take an ARIA snapshot first to understand the page before interacting with elements. " +
 				"Don't guess selectors - use the snapshot to find the correct ones. " +
-				"When you find the target element in the snapshot, proceed with the action immediately.",
+				"When you find the target element in the snapshot, proceed with the action immediately.\n\n" +
+				"WORKFLOW COMPLETION:\n" +
+				"- When you have completed ALL required automation steps, call the 'workflow_complete' tool\n" +
+				"- This signals the end of the automation session and prevents further unnecessary interactions\n" +
+				"- Do NOT call workflow_complete until ALL steps in the instructions are finished\n" +
+				"- Example completion scenarios: after taking final screenshot, after submitting forms, when workflow objectives are met",
 		},
 		{
 			Role:    openai.ChatMessageRoleUser,
@@ -443,6 +770,33 @@ func sendChatRequest(ctx context.Context, client *openai.Client, userMessage str
 			fmt.Printf("Executing tool: %s\n", toolCall.Function.Name)
 			finalResponse.WriteString(fmt.Sprintf("Executing tool: %s\n", toolCall.Function.Name))
 
+			// Handle the workflow_complete pseudo-tool
+			if toolCall.Function.Name == "workflow_complete" {
+				// Parse the completion message
+				var args map[string]interface{}
+				var completionMessage string = "Workflow completed successfully"
+				if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err == nil {
+					if msg, ok := args["message"].(string); ok && msg != "" {
+						completionMessage = msg
+					}
+				}
+
+				fmt.Printf("\n🎯 WORKFLOW COMPLETE - %s\n", completionMessage)
+				fmt.Printf("✅ All automation steps successfully executed. Session terminated.\n")
+				finalResponse.WriteString(fmt.Sprintf("\n🎯 WORKFLOW COMPLETE - %s\n", completionMessage))
+				finalResponse.WriteString("✅ All automation steps successfully executed. Session terminated.\n")
+
+				// Add the workflow complete message to conversation
+				toolMessage := openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					Content:    "Workflow completed successfully. Automation session terminated.",
+					ToolCallID: toolCall.ID,
+				}
+				messages = append(messages, toolMessage)
+
+				return finalResponse.String(), nil
+			}
+
 			// Execute the MCP tool
 			result, err := executeMCPTool(ctx, mcpSession, toolCall.Function.Name, toolCall.Function.Arguments)
 			if err != nil {
@@ -486,11 +840,8 @@ func sendChatRequest(ctx context.Context, client *openai.Client, userMessage str
 		}
 
 		// Add a 30-second delay between steps to avoid rate limits
-		if len(choice.Message.ToolCalls) > 0 {
-			fmt.Printf("\n⏱️  Waiting 30 seconds to avoid rate limits...\n")
-			time.Sleep(30 * time.Second)
-			fmt.Printf("✅ Continuing to next step...\n\n")
-		}
+		fmt.Printf("\n⏱️  Waiting 30 seconds to avoid rate limits...\n")
+		time.Sleep(30 * time.Second)
 
 		// Continue to next iteration for model to process tool results
 	}
@@ -539,5 +890,464 @@ func executeMCPTool(ctx context.Context, mcpSession *mcp.ClientSession, toolName
 		}
 	}
 
-	return resultText.String(), nil
+	resultString := resultText.String()
+
+	// Persist ARIA snapshot to ChromaDB if enabled
+	// We check if the result contains "ARIA SNAPSHOT" which indicates an ARIA snapshot
+	// This handles both explicit snapshot tools and interaction tools that return snapshots
+	if globalChromaClient != nil && (strings.Contains(resultString, "ARIA SNAPSHOT") || strings.Contains(resultString, "ARIA Snapshot")) {
+		fmt.Printf("📊 Persisting latest ARIA snapshot to ChromaDB (from tool: %s)...\n", toolName)
+
+		// SYNCHRONOUS persistence - block until complete
+		if err := persistAriaSnapshot(ctx, resultString, currentPageURL); err != nil {
+			// Log error but don't fail the tool execution
+			// The ARIA data is still available in the result
+			log.Printf("WARNING: Failed to persist ARIA snapshot: %v", err)
+		}
+	}
+
+	// Track current URL for navigate calls
+	if toolName == "navigate" {
+		if url, ok := args["url"].(string); ok {
+			currentPageURL = url
+			fmt.Printf("📍 Current URL tracked: %s\n", url)
+		}
+	}
+
+	return resultString, nil
+}
+
+// runChromaDBDrivenWorkflow executes workflow using ChromaDB for element selection
+func runChromaDBDrivenWorkflow(ctx context.Context, openaiClient *openai.Client, session *mcp.ClientSession, userInstructions string, tools []*mcp.Tool) (string, error) {
+	// Validate ChromaDB is available
+	if globalChromaClient == nil {
+		return "", fmt.Errorf("ChromaDB-driven mode requires ChromaDB to be enabled. Use --enable-chromadb=true and ensure ChromaDB is running")
+	}
+
+	fmt.Println("\n📋 Step 1: Generating execution plan from user instructions...")
+
+	// Generate step plan from LLM
+	steps, err := generateStepPlan(ctx, openaiClient, userInstructions, tools)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate step plan: %v", err)
+	}
+
+	fmt.Printf("\n✅ Generated %d steps:\n", len(steps))
+	for i, step := range steps {
+		fmt.Printf("  %d. [%s] %s\n", i+1, step.ToolName, step.Description)
+	}
+
+	fmt.Println("\n🚀 Step 2: Executing plan with ChromaDB-driven element selection...")
+
+	// Execute steps
+	var executionLog strings.Builder
+	executionLog.WriteString("ChromaDB-Driven Workflow Execution:\n\n")
+
+	for i, step := range steps {
+		fmt.Printf("\n▶️  Executing Step %d/%d: [%s] %s\n", i+1, len(steps), step.ToolName, step.Description)
+
+		result, err := executeStep(ctx, session, step)
+		if err != nil {
+			errMsg := fmt.Sprintf("❌ Step %d failed: %v\n", i+1, err)
+			fmt.Print(errMsg)
+			executionLog.WriteString(errMsg)
+			return executionLog.String(), err
+		}
+
+		successMsg := fmt.Sprintf("✅ Step %d completed\n", i+1)
+		fmt.Print(successMsg)
+		executionLog.WriteString(fmt.Sprintf("Step %d: [%s] %s\n", i+1, step.ToolName, step.Description))
+		executionLog.WriteString(fmt.Sprintf("Result: %s\n\n", truncateString(result, 200)))
+
+		// Add delay between steps to avoid overwhelming the system
+		if i < len(steps)-1 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	fmt.Println("\n🎉 Workflow completed successfully!")
+	executionLog.WriteString("\n🎉 All steps executed successfully\n")
+
+	return executionLog.String(), nil
+}
+
+// generateStepPlan calls LLM to convert user instructions into structured steps
+func generateStepPlan(ctx context.Context, openaiClient *openai.Client, userInstructions string, tools []*mcp.Tool) ([]Step, error) {
+	// Build tool descriptions for the prompt
+	var toolDescriptions strings.Builder
+	toolDescriptions.WriteString("Available tools:\n")
+	for _, tool := range tools {
+		toolDescriptions.WriteString(fmt.Sprintf("- %s: %s\n", tool.Name, tool.Description))
+	}
+
+	// Create system prompt for step generation
+	systemPrompt := `You are a browser automation planner. Your job is to convert user instructions into a structured step-by-step plan.
+
+CRITICAL FORMATTING RULES:
+1. Output ONE step per line
+2. Each step MUST start with [TOOL:toolname] where toolname is one of the available tools
+3. After the tool prefix, write a natural language description of what to do
+4. For multi-parameter tools like type_text, include ALL details in the description
+
+` + toolDescriptions.String() + `
+
+STEP FORMAT EXAMPLES:
+[TOOL:navigate] Navigate to https://www.google.com
+[TOOL:aria_snapshot_v2] Take snapshot of the page to find elements
+[TOOL:click_button] Click the search button
+[TOOL:type_text] Type "artificial intelligence" into the search box
+[TOOL:click_link] Click the link for Wikipedia
+[TOOL:screenshot] Take a screenshot of the results
+
+IMPORTANT GUIDELINES:
+- If user instructions are brief, elaborate them into detailed steps
+- If user instructions are already detailed, you can use them as-is or refine if needed
+- ALWAYS start with a navigate step if a URL is implied or mentioned
+- After navigate, ALWAYS include aria_snapshot_v2 to populate the page structure
+- Be specific about what text to type, which buttons/links to click
+- Use aria_snapshot_v2 after navigation to enable element finding
+- End with screenshot or workflow_complete when appropriate
+
+CRITICAL - AUTHENTICATION & LOGIN HANDLING:
+- NEVER include login, sign-in, authentication, password, or credential-related steps
+- DO NOT generate steps for clicking login buttons, typing usernames/passwords, or any authentication flow
+- If user mentions "login" or "sign in", SKIP those steps entirely in your plan
+- Start the plan AFTER login is assumed to be complete
+- The system will automatically pause after navigation to allow the user to login manually
+- Example: If user says "Login to GitHub and search for repos", generate steps starting with the search, NOT the login
+- Assume the user is already logged in when generating post-navigation steps
+
+Now convert the following user instructions into steps:`
+
+	messages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: systemPrompt,
+		},
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: userInstructions,
+		},
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:       openai.GPT4o,
+		Messages:    messages,
+		Temperature: 0.3,
+	}
+
+	resp, err := openaiClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("OpenAI API error: %v", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("no response from OpenAI")
+	}
+
+	planText := resp.Choices[0].Message.Content
+	fmt.Printf("\n📝 LLM Generated Plan:\n%s\n", planText)
+
+	// Parse the plan into steps
+	steps := parseSteps(planText)
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("failed to parse any steps from LLM response")
+	}
+
+	return steps, nil
+}
+
+// parseSteps parses LLM output into Step structs
+func parseSteps(planText string) []Step {
+	var steps []Step
+
+	// Match lines starting with [TOOL:toolname]
+	stepRegex := regexp.MustCompile(`(?m)^\[TOOL:(\w+)\]\s*(.+)$`)
+	matches := stepRegex.FindAllStringSubmatch(planText, -1)
+
+	for _, match := range matches {
+		if len(match) == 3 {
+			steps = append(steps, Step{
+				ToolName:     match[1],
+				Description:  strings.TrimSpace(match[2]),
+				OriginalLine: match[0],
+			})
+		}
+	}
+
+	return steps
+}
+
+// executeStep executes a single step using ChromaDB for element selection
+func executeStep(ctx context.Context, session *mcp.ClientSession, step Step) (string, error) {
+	switch step.ToolName {
+	case "navigate":
+		return executeNavigateStep(ctx, session, step)
+	case "aria_snapshot", "aria_snapshot_v2":
+		return executeAriaSnapshotStep(ctx, session, step)
+	case "screenshot", "refresh_page", "close_browser", "workflow_complete":
+		// These tools don't need element selection
+		return executeSimpleTool(ctx, session, step.ToolName)
+	case "click_button", "click_link", "click":
+		return executeClickStep(ctx, session, step)
+	case "type_text":
+		return executeTypeTextStep(ctx, session, step)
+	case "select_dropdown", "choose_option":
+		return executeSelectStep(ctx, session, step)
+	default:
+		return "", fmt.Errorf("unsupported tool: %s", step.ToolName)
+	}
+}
+
+// executeNavigateStep handles navigation and auto-snapshots for ChromaDB population
+func executeNavigateStep(ctx context.Context, session *mcp.ClientSession, step Step) (string, error) {
+	// Extract URL from description
+	urlRegex := regexp.MustCompile(`https?://[^\s]+`)
+	url := urlRegex.FindString(step.Description)
+	if url == "" {
+		// Try to extract domain and construct URL
+		if strings.Contains(strings.ToLower(step.Description), "google") {
+			url = "https://www.google.com"
+		} else {
+			return "", fmt.Errorf("could not extract URL from: %s", step.Description)
+		}
+	}
+
+	fmt.Printf("  🌐 Navigating to: %s\n", url)
+
+	args := map[string]interface{}{"url": url}
+	argsJSON, _ := json.Marshal(args)
+
+	result, err := executeMCPTool(ctx, session, "navigate", string(argsJSON))
+	if err != nil {
+		return "", err
+	}
+
+	// Auto-snapshot after navigation to populate ChromaDB
+	fmt.Println("  📸 Auto-taking ARIA snapshot (V2) to populate ChromaDB...")
+	time.Sleep(2 * time.Second) // Wait for page load
+
+	snapshotResult, err := executeMCPTool(ctx, session, "aria_snapshot_v2", "{}")
+	if err != nil {
+		log.Printf("WARNING: Auto-snapshot failed: %v", err)
+	} else {
+		fmt.Printf("  ✅ ChromaDB populated with %d elements\n", totalElementsStored)
+	}
+
+	// Always pause for manual login after navigation
+	fmt.Println("\n" + strings.Repeat("━", 70))
+	fmt.Println("🔐 LOGIN CHECKPOINT")
+	fmt.Println(strings.Repeat("━", 70))
+	fmt.Println("If login/authentication is required, please complete it now.")
+	fmt.Println("Otherwise, just press ENTER to continue with automation...")
+	fmt.Println(strings.Repeat("━", 70))
+	fmt.Print("→ Press ENTER when ready: ")
+
+	// Wait for user confirmation
+	reader := bufio.NewReader(os.Stdin)
+	_, _ = reader.ReadString('\n')
+
+	fmt.Println("✅ Continuing with automation...\n")
+
+	return result + "\n[Auto-snapshot: " + snapshotResult + "]", nil
+}
+
+// executeAriaSnapshotStep executes aria_snapshot_v2 tool
+func executeAriaSnapshotStep(ctx context.Context, session *mcp.ClientSession, step Step) (string, error) {
+	fmt.Println("  📸 Taking ARIA snapshot (V2)...")
+	return executeMCPTool(ctx, session, "aria_snapshot_v2", "{}")
+}
+
+// executeSimpleTool executes tools that don't require parameters
+func executeSimpleTool(ctx context.Context, session *mcp.ClientSession, toolName string) (string, error) {
+	fmt.Printf("  🔧 Executing %s...\n", toolName)
+	return executeMCPTool(ctx, session, toolName, "{}")
+}
+
+// executeClickStep executes click actions using ChromaDB to find element
+func executeClickStep(ctx context.Context, session *mcp.ClientSession, step Step) (string, error) {
+	// Query ChromaDB for the element
+	selector, err := queryChromaDBForElement(ctx, step.Description)
+	if err != nil {
+		return "", fmt.Errorf("failed to find element: %v", err)
+	}
+
+	fmt.Printf("  🖱️  Clicking element: %s\n", selector)
+
+	args := map[string]interface{}{"selector": selector}
+	argsJSON, _ := json.Marshal(args)
+
+	return executeMCPTool(ctx, session, step.ToolName, string(argsJSON))
+}
+
+// executeTypeTextStep executes type_text using ChromaDB to find element
+func executeTypeTextStep(ctx context.Context, session *mcp.ClientSession, step Step) (string, error) {
+	// Parse text to type and target element from description
+	// Example: "Type 'artificial intelligence' into the search box"
+	textRegex := regexp.MustCompile(`['"]([^'"]+)['"]`)
+	textMatch := textRegex.FindStringSubmatch(step.Description)
+	if textMatch == nil {
+		return "", fmt.Errorf("could not extract text to type from: %s", step.Description)
+	}
+	textToType := textMatch[1]
+
+	// Extract target description (everything after "into" or "in")
+	targetDesc := step.Description
+	if idx := strings.Index(strings.ToLower(step.Description), " into "); idx != -1 {
+		targetDesc = step.Description[idx+6:]
+	} else if idx := strings.Index(strings.ToLower(step.Description), " in "); idx != -1 {
+		targetDesc = step.Description[idx+4:]
+	}
+
+	// Query ChromaDB for the element
+	selector, err := queryChromaDBForElement(ctx, targetDesc)
+	if err != nil {
+		return "", fmt.Errorf("failed to find element for typing: %v", err)
+	}
+
+	fmt.Printf("  ⌨️  Typing '%s' into element: %s\n", textToType, selector)
+
+	args := map[string]interface{}{
+		"selector": selector,
+		"text":     textToType,
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	return executeMCPTool(ctx, session, "type_text", string(argsJSON))
+}
+
+// executeSelectStep executes select/dropdown actions using ChromaDB
+func executeSelectStep(ctx context.Context, session *mcp.ClientSession, step Step) (string, error) {
+	// Query ChromaDB for the element
+	selector, err := queryChromaDBForElement(ctx, step.Description)
+	if err != nil {
+		return "", fmt.Errorf("failed to find element: %v", err)
+	}
+
+	fmt.Printf("  📋 Selecting from element: %s\n", selector)
+
+	args := map[string]interface{}{"selector": selector}
+	argsJSON, _ := json.Marshal(args)
+
+	return executeMCPTool(ctx, session, step.ToolName, string(argsJSON))
+}
+
+// queryChromaDBForElement queries ChromaDB for the most relevant element
+func queryChromaDBForElement(ctx context.Context, queryText string) (string, error) {
+	if globalChromaCollection == nil {
+		return "", fmt.Errorf("ChromaDB collection not initialized")
+	}
+
+	fmt.Printf("  🔍 Querying ChromaDB for: '%s'\n", queryText)
+
+	// Query ChromaDB for semantically similar elements using the client wrapper
+	// We fetch top 5 results to allow filtering out structural nodes (like RootWebArea)
+	results, err := globalChromaClient.QueryDocuments(globalChromaCollection, []string{queryText}, 5)
+	if err != nil {
+		return "", fmt.Errorf("ChromaDB query failed: %v", err)
+	}
+
+	if results == nil {
+		return "", fmt.Errorf("no results returned from ChromaDB")
+	}
+
+	// Get groups
+	idGroups := results.GetIDGroups()
+	metadataGroups := results.GetMetadatasGroups()
+	documentGroups := results.GetDocumentsGroups()
+
+	if len(idGroups) == 0 || len(idGroups[0]) == 0 {
+		return "", fmt.Errorf("no matching elements found in ChromaDB for: %s", queryText)
+	}
+
+	var bestSelector string
+	var bestDisplayText string
+	var bestElementType string
+
+	// Iterate through results to find the best non-structural element
+	for i := 0; i < len(idGroups[0]); i++ {
+		metadata := metadataGroups[0][i]
+		displayText := documentGroups[0][i].ContentString()
+		elementType, _ := metadata.GetString("element_type")
+
+		// Skip structural roles that are almost never the intended target for clicks/typing
+		// These often match page titles or large containers that shouldn't be clicked.
+		if elementType == "RootWebArea" || elementType == "WebArea" || elementType == "document" || elementType == "none" {
+			continue
+		}
+
+		// Extract selector
+		var selector string
+		if primarySelector, ok := metadata.GetString("primary_selector"); ok && primarySelector != "" {
+			selector = primarySelector
+		} else if altSelector, ok := metadata.GetString("alt_selector"); ok && altSelector != "" {
+			selector = altSelector
+		} else if displayText != "" {
+			selector = sanitizeDisplayTextForSelector(displayText)
+		}
+
+		if selector != "" {
+			bestSelector = selector
+			bestDisplayText = displayText
+			bestElementType = elementType
+			break
+		}
+	}
+
+	// Fallback to the very first result if we couldn't find a "good" one
+	if bestSelector == "" {
+		metadata := metadataGroups[0][0]
+		bestDisplayText = documentGroups[0][0].ContentString()
+		bestElementType, _ = metadata.GetString("element_type")
+
+		if primarySelector, ok := metadata.GetString("primary_selector"); ok && primarySelector != "" {
+			bestSelector = primarySelector
+		} else if altSelector, ok := metadata.GetString("alt_selector"); ok && altSelector != "" {
+			bestSelector = altSelector
+		} else {
+			bestSelector = sanitizeDisplayTextForSelector(bestDisplayText)
+		}
+	}
+
+	// Log if we are using a fallback selector
+	if !strings.Contains(bestSelector, "[") && !strings.Contains(bestSelector, "#") && !strings.Contains(bestSelector, ".") {
+		fmt.Printf("  ⚠️  No robust selector found, using display text as fallback\n")
+		fmt.Printf("      Original text: '%s'\n", truncateString(bestDisplayText, 60))
+		fmt.Printf("      Sanitized selector: '%s'\n", truncateString(bestSelector, 60))
+	}
+
+	fmt.Printf("  ✓ Found: [%s] '%s' → %s\n", bestElementType, truncateString(bestDisplayText, 40), truncateString(bestSelector, 60))
+
+	return bestSelector, nil
+}
+
+// sanitizeDisplayTextForSelector cleans up display text for use as a selector
+func sanitizeDisplayTextForSelector(text string) string {
+	// Remove common ARIA/selector syntax that might confuse the browser
+	// Remove things like [aria-label="..."], selectors, etc.
+
+	// If text contains newlines, take only the first line
+	if idx := strings.Index(text, "\n"); idx != -1 {
+		text = text[:idx]
+	}
+
+	// If text contains [ or other selector-like syntax, just extract the clean text
+	// Look for pattern like: text [aria-label="something"]
+	if idx := strings.Index(text, "["); idx != -1 {
+		// Take everything before the bracket
+		text = strings.TrimSpace(text[:idx])
+	}
+
+	// Trim any extra whitespace
+	text = strings.TrimSpace(text)
+
+	return text
+}
+
+// truncateString truncates a string to maxLen characters
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
